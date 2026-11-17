@@ -1,0 +1,42 @@
+---
+features:
+  - |
+    NetApp Cinder driver for ASAr2 has been updated to now use an SVM as
+    a pool. Instead of the previous implementation of cluster as pool.
+    This implementation gives flexibility for the customers to map multiple
+    SVMs as Cinder pools.
+
+    Cinder driver for ASAr2 now supports additional capabilities for ASAr2
+    platform.
+
+    The new capabilities include below:
+
+      - netapp_disaggregated_platform - True means the driver is of type
+        disaggregated. Unified ONTAP platform should report a False value.
+      - netapp_storage_availability_zones - Reports all the storage availability
+        zones that are mapped to the SVM.
+
+    Apart from the new capabilities, below capabilities are also fixed:
+
+      - pool_name - Pool name is now suffixed with cluster_name and svm name
+        pool_name: <cluster_name>[:<svm_name>]
+      - consistencygroup_support and consistent_group_snapshot_enabled
+        capabilities now reports as False as they are yet to be supported
+        for ASAr2.
+      - free_capacity_gb - free capacity is reported as sum of aggregate
+        level free capacity across mapped aggregates.
+      - total_capacity_gb - total capacity is reported as sum of aggregate
+        level total capacity across mapped aggregates.
+      - provisioned_capacity_gb - provisioned capacity is calculated as sum of
+        sizes all the storage units created on the SVM. Since snapshots
+        in ASAr2 are implemented as storage-unit snapshots (FlexVol Snapshots)
+        there is no need to exclude snapshot volumes from the list of storage
+        units.
+      - utilization - Due to performance counter APIs not present today,
+        utilization of pool is fixed as 50 units as of now. This will be fixed
+        in upcoming release where plan is to use ONTAP performance APIs to
+        implement the utilization factor.
+      - total_volumes - Total volumes is the sum of all LUNs/Namespaces dpending
+        on protocol, created on a pool. This capability can be used to loadbalance
+        the volume creation using goodness and filter functions if multiple SVMs
+        are added from the same cluster as pools.

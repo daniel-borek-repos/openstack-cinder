@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+# Copyright 2010 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+"""Starter script for Cinder Volume."""
+
+from cinder import monkey_patch; monkey_patch.patch()  # noqa
+
+import logging as python_logging  # noqa: I100
+import shlex
+import sys
+
+import os_brick
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_privsep import priv_context
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
+import oslo_service
+import oslo_service.backend
+
+# Need to register global_opts
+from cinder.common import config  # noqa
+from cinder.common import constants
+from cinder.db import api as session
+from cinder import i18n
+i18n.enable_lazy()
+from cinder import objects
+from cinder import service
+from cinder import utils
+from cinder import version
+
+
+CONF = cfg.CONF
+
+host_opt = cfg.StrOpt('backend_host', help='Backend override of host value.')
+CONF.register_cli_opt(host_opt)
+
+backend_name_opt = cfg.StrOpt(
+    'backend_name',
+    help='NOTE: For Windows internal use only. The name of the backend to be '
+         'managed by this process. It must be one of the backends defined '
+         'using the "enabled_backends" option. Note that normally, this '
+         'should not be used directly. Cinder uses it internally in order to '
+         'spawn subprocesses on Windows.')
+CONF.register_cli_opt(backend_name_opt)
+
+
+cluster_opt = cfg.StrOpt('cluster',
+                         default=None,
+                         help='Name of this cluster. Used to group volume '
+                              'hosts that share the same backend '
+                              'configurations to work in HA Active-Active '
+                              'mode.')
+CONF.register_opt(cluster_opt)
+
+LOG = None
+
+service_started = False
+
+
+def _launch_service(launcher: 'oslo_service.ProcessLauncher',
+                    backend: str) -> None:
+    CONF.register_opt(host_opt, group=backend)
+    backend_host = getattr(CONF, backend).backend_host
+    host = "%s@%s" % (backend_host or CONF.host, backend)
+    # We also want to set cluster to None on empty strings, and we
+    # ignore leading and trailing spaces.
+    cluster = CONF.cluster and CONF.cluster.strip()
+    cluster = (cluster or None) and '%s@%s' % (cluster, backend)
+    try:
+        server = service.Service.create(host=host,
+                                        service_name=backend,
+                                        binary=constants.VOLUME_BINARY,
+                                        coordination=True,
+                                        cluster=cluster)
+    except Exception:
+        assert LOG is not None
+        LOG.exception('Volume service %s failed to start.', host)
+    else:
+        # Dispose of the whole DB connection pool here before
+        # starting another process.  Otherwise we run into cases where
+        # child processes share DB connections which results in errors.
+        session.dispose_engine()
+        launcher.launch_service(server)
+        _notify_service_started()
+
+
+def _ensure_service_started() -> None:
+    if not service_started:
+        assert LOG is not None
+        LOG.error('No volume service(s) started successfully, terminating.')
+        sys.exit(1)
+
+
+def _notify_service_started() -> None:
+    global service_started
+    service_started = True
+
+
+def _launch_services() -> None:
+    launcher = service.process_launcher()
+
+    backend: str
+    for backend in filter(None, CONF.enabled_backends):
+        _launch_service(launcher, backend)
+
+    _ensure_service_started()
+
+    launcher.wait()
+
+
+def main() -> None:
+    objects.register_all()
+    gmr_opts.set_defaults(CONF)
+    CONF(sys.argv[1:], project='cinder',
+         version=version.version_string())
+    logging.setup(CONF, "cinder")
+    python_logging.captureWarnings(True)
+    priv_context.init(root_helper=shlex.split(utils.get_root_helper()))
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
+    os_brick.setup(CONF)
+    global LOG
+    LOG = logging.getLogger(__name__)
+
+    if not CONF.enabled_backends:
+        LOG.error('Configuration for cinder-volume does not specify '
+                  '"enabled_backends". Using DEFAULT section to configure '
+                  'drivers is not supported since Ocata.')
+        sys.exit(1)
+
+    _launch_services()

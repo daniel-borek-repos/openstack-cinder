@@ -1,0 +1,9 @@
+{
+    "cluster": {
+        "name": "cluster_name",
+        "state": "down",
+        "binary": "cinder-volume",
+        "status": "enabled",
+        "disabled_reason": null
+    }
+}

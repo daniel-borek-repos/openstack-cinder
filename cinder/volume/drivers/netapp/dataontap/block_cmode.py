@@ -1,0 +1,1520 @@
+# Copyright (c) 2012 NetApp, Inc.  All rights reserved.
+# Copyright (c) 2014 Ben Swartzlander.  All rights reserved.
+# Copyright (c) 2014 Navneet Singh.  All rights reserved.
+# Copyright (c) 2014 Clinton Knight.  All rights reserved.
+# Copyright (c) 2014 Alex Meade.  All rights reserved.
+# Copyright (c) 2014 Andrew Kerr.  All rights reserved.
+# Copyright (c) 2014 Jeff Applewhite.  All rights reserved.
+# Copyright (c) 2015 Tom Barron.  All rights reserved.
+# Copyright (c) 2015 Goutham Pacha Ravi. All rights reserved.
+# Copyright (c) 2016 Mike Rooney. All rights reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+"""
+Volume driver library for NetApp C-mode block storage systems.
+"""
+import time
+
+from oslo_log import log as logging
+from oslo_service import loopingcall
+from oslo_utils import excutils
+from oslo_utils import timeutils
+from oslo_utils import units
+
+from cinder import exception
+from cinder.i18n import _
+from cinder.objects import fields
+from cinder.volume.drivers.netapp.dataontap import block_base
+from cinder.volume.drivers.netapp.dataontap.client import api as netapp_api
+from cinder.volume.drivers.netapp.dataontap.performance import perf_cmode
+from cinder.volume.drivers.netapp.dataontap.utils import capabilities
+from cinder.volume.drivers.netapp.dataontap.utils import data_motion
+from cinder.volume.drivers.netapp.dataontap.utils import loopingcalls
+from cinder.volume.drivers.netapp.dataontap.utils import utils as dot_utils
+from cinder.volume.drivers.netapp import options as na_opts
+from cinder.volume.drivers.netapp import utils as na_utils
+from cinder.volume import volume_utils
+
+
+LOG = logging.getLogger(__name__)
+
+
+class NetAppBlockStorageCmodeLibrary(
+        block_base.NetAppBlockStorageLibrary,
+        data_motion.DataMotionMixin,
+        metaclass=volume_utils.TraceWrapperMetaclass):
+    """NetApp block storage library for Data ONTAP (Cluster-mode).
+
+    Version history:
+
+    .. code-block:: none
+
+        1.0.0 - Driver development before Wallaby
+        2.0.0 - Add support for QoS minimums specs
+                Add support for dynamic Adaptive QoS policy group creation
+        3.0.0 - Add support for Intra-cluster Storage assisted volume migration
+                Add support for revert to snapshot
+        4.0.0 - Add Cinder Active/Active support (High Availability)
+                Implement Active/Active replication support
+
+    """
+
+    VERSION = "4.0.0"
+
+    REQUIRED_CMODE_FLAGS = ['netapp_vserver']
+
+    def __init__(self, driver_name, driver_protocol, **kwargs):
+        super(NetAppBlockStorageCmodeLibrary, self).__init__(driver_name,
+                                                             driver_protocol,
+                                                             **kwargs)
+        self.configuration.append_config_values(na_opts.netapp_cluster_opts)
+        self.driver_mode = 'cluster'
+        self.failed_over_backend_name = kwargs.get('active_backend_id').\
+            strip() if kwargs.get('active_backend_id') is not None else None
+        self.failed_over = bool(self.failed_over_backend_name)
+        self.replication_enabled = (
+            True if self.get_replication_backend_names(
+                self.configuration) else False)
+        self.last_perf_update = 0
+        self.last_dedupe_update = 0
+        # Hardcoded False for Hibiscus; this is not a config option.
+        # Cross-pool lun-copy works but is inefficient, so it will be
+        # re-enabled after optimizations in Indri.
+        self.clone_across_pools = False
+
+    def do_setup(self, context):
+        super(NetAppBlockStorageCmodeLibrary, self).do_setup(context)
+        na_utils.check_flags(self.REQUIRED_CMODE_FLAGS, self.configuration)
+
+        force_rest = False
+        # Active Sync Replication requires REST client
+        is_active_sync = False
+        if self.replication_enabled:
+            replication_policy = self.get_replication_policy(
+                self.configuration)
+            if replication_policy in (
+                na_utils.ReplicationPolicy.AUTOMATED_FAIL_OVER.value,
+                na_utils.ReplicationPolicy.AUTOMATED_FAIL_OVER_DUPLEX.value,
+            ):
+                is_active_sync = True
+                force_rest = True
+
+        # cDOT API client
+        self.zapi_client = dot_utils.get_client_for_backend(
+            self.failed_over_backend_name or self.backend_name,
+            force_rest=force_rest)
+        self.vserver = self.zapi_client.vserver
+
+        self.dest_zapi_client = None
+        if is_active_sync:
+            backend_names = self.get_replication_backend_names(
+                self.configuration)
+            for dest_backend_name in backend_names:
+                dest_backend_config = (
+                    dot_utils.get_backend_configuration(
+                        dest_backend_name))
+                dest_vserver = dest_backend_config.netapp_vserver
+                self.dest_zapi_client = (
+                    dot_utils.get_client_for_backend(
+                        dest_backend_name,
+                        vserver_name=dest_vserver,
+                        force_rest=force_rest))
+        # Storage service catalog
+        self.ssc_library = capabilities.CapabilitiesLibrary(
+            self.driver_protocol, self.vserver, self.zapi_client,
+            self.configuration)
+
+        self.ssc_library.check_api_permissions()
+
+        self.using_cluster_credentials = (
+            self.ssc_library.cluster_user_supported())
+
+        # Performance monitoring library
+        self.perf_library = perf_cmode.PerformanceCmodeLibrary(
+            self.zapi_client)
+
+    def _update_zapi_client(self, backend_name):
+        """Set cDOT API client for the specified config backend stanza name."""
+
+        self.zapi_client = dot_utils.get_client_for_backend(backend_name)
+        self.vserver = self.zapi_client.vserver
+        self.ssc_library._update_for_failover(self.zapi_client,
+                                              self._get_flexvol_to_pool_map())
+        ssc = self.ssc_library.get_ssc()
+        self.perf_library._update_for_failover(self.zapi_client, ssc)
+        # Clear LUN table cache
+        self.lun_table = {}
+
+    def check_for_setup_error(self):
+        """Check that the driver is working and can communicate."""
+        if (not self._get_flexvol_to_pool_map()
+                and not self.configuration.netapp_disaggregated_platform):
+            msg = _('No pools are available for provisioning volumes. '
+                    'Ensure that the configuration option '
+                    'netapp_pool_name_search_pattern is set correctly.')
+            raise na_utils.NetAppDriverException(msg)
+        elif (self.configuration.netapp_disaggregated_platform
+              and not self._get_cluster_to_pool_map()):
+            msg = _('No pools are available for provisioning volumes. '
+                    'Ensure ASA r2 configuration option is set correctly.')
+            raise na_utils.NetAppDriverException(msg)
+
+        # Validate existing snapmirror scenario for replication
+        if self.replication_enabled:
+            LOG.debug("Replication is enabled. Performing existing "
+                      "snapmirror validation to check for conflicting "
+                      "relationships.")
+            flexvol_names = self.ssc_library.get_ssc_flexvol_names()
+            self.validate_no_conflicting_snapmirrors(
+                self.configuration, self.backend_name, flexvol_names)
+
+        self._add_looping_tasks()
+        super(NetAppBlockStorageCmodeLibrary, self).check_for_setup_error()
+
+    def _add_looping_tasks(self):
+        """Add tasks that need to be executed at a fixed interval."""
+
+        # Note(cknight): Run the update once in the current thread to prevent a
+        # race with the first invocation of _update_volume_stats.
+        self._update_ssc()
+
+        # Add the task that updates the slow-changing storage service catalog
+        self.loopingcalls.add_task(self._update_ssc,
+                                   loopingcalls.ONE_HOUR,
+                                   loopingcalls.ONE_HOUR)
+
+        self.loopingcalls.add_task(
+            self._handle_housekeeping_tasks,
+            loopingcalls.TEN_MINUTES,
+            0)
+
+        super(NetAppBlockStorageCmodeLibrary, self)._add_looping_tasks()
+
+    def _handle_housekeeping_tasks(self):
+        """Handle various cleanup activities."""
+        active_backend = self.failed_over_backend_name or self.backend_name
+
+        # Add the task that harvests soft-deleted QoS policy groups.
+        if self.using_cluster_credentials:
+            self.zapi_client.remove_unused_qos_policy_groups()
+
+        LOG.debug("Current service state: Replication enabled: %("
+                  "replication)s. Failed-Over: %(failed)s. Active Backend "
+                  "ID: %(active)s",
+                  {
+                      'replication': self.replication_enabled,
+                      'failed': self.failed_over,
+                      'active': active_backend,
+                  })
+
+        # Create pool mirrors if whole-backend replication configured
+        if self.replication_enabled and not self.failed_over:
+            if self._is_consistent_replication_enabled(self.configuration):
+                LOG.debug("Ensuring consistent replication snapmirrors.")
+
+                # The storage object type is used seperate out volume and lun
+                # replication based on plaform type.
+                # volume for unified and lun for asar2(disagregated)
+                storage_object_type = na_utils.StorageObjectType.VOLUME
+                storage_object_names = self.ssc_library.get_ssc_flexvol_names()
+                self.ensure_consistent_replication_snapmirrors(
+                    self.configuration, self.backend_name, storage_object_type,
+                    storage_object_names)
+            else:
+                LOG.debug("Ensuring replication snapmirrors across each "
+                          " or one CG per FlexVol.")
+                self.ensure_snapmirrors(
+                    self.configuration, self.backend_name,
+                    self.ssc_library.get_ssc_flexvol_names())
+
+    def _handle_ems_logging(self):
+        """Log autosupport messages."""
+
+        base_ems_message = dot_utils.build_ems_log_message_0(
+            self.driver_name, self.app_version)
+        self.zapi_client.send_ems_log_message(base_ems_message)
+
+        pool_ems_message = dot_utils.build_ems_log_message_1(
+            self.driver_name, self.app_version, self.vserver,
+            self.ssc_library.get_ssc_flexvol_names(), [])
+        self.zapi_client.send_ems_log_message(pool_ems_message)
+
+    def _create_lun(self, volume_name, lun_name, size,
+                    metadata, qos_policy_group_name=None,
+                    qos_policy_group_is_adaptive=False):
+        """Creates a LUN, handling Data ONTAP differences as needed."""
+        LOG.debug("Creating LUN with volume name %(vol)s and lun name %(lun)s",
+                  {'vol': volume_name, 'lun': lun_name})
+        self.zapi_client.create_lun(
+            volume_name, lun_name, size, metadata, qos_policy_group_name,
+            qos_policy_group_is_adaptive)
+        LOG.debug("Successfully created LUN with volume name %(vol)s and lun "
+                  "name %(lun)s", {'vol': volume_name, 'lun': lun_name})
+
+    def _create_lun_handle(self, metadata, vserver=None):
+        """Returns LUN handle based on filer type."""
+        vserver = vserver or self.vserver
+        return '%s:%s' % (self.vserver, metadata['Path'])
+
+    def _find_mapped_lun_igroup(self, path, initiator_list):
+        """Find an igroup for a LUN mapped to the given initiator(s)."""
+        igroups = [igroup['initiator-group-name'] for igroup in
+                   self.zapi_client.get_igroup_by_initiators(initiator_list)]
+        # Map igroup-name to lun-id, but only for the requested initiators.
+        lun_map = {v['initiator-group']: v['lun-id']
+                   for v in self.zapi_client.get_lun_map(path)
+                   if v['initiator-group'] in igroups}
+
+        igroup_name = lun_id = None
+        # Give preference to OpenStack igroups, just use the last one if not
+        # present to allow unmapping old mappings that used a custom igroup.
+        for igroup_name, lun_id in lun_map.items():
+            if igroup_name.startswith(na_utils.OPENSTACK_PREFIX):
+                break
+        return igroup_name, lun_id
+
+    def _clone_lun(self, name, new_name, space_reserved=None,
+                   qos_policy_group_name=None, src_block=0, dest_block=0,
+                   block_count=0, source_snapshot=None, is_snapshot=False,
+                   qos_policy_group_is_adaptive=False):
+        """Clone LUN with the given handle to the new name."""
+        if not space_reserved:
+            space_reserved = self.lun_space_reservation
+        metadata = self._get_lun_attr(name, 'metadata')
+        volume = metadata['Volume']
+
+        try:
+            self.zapi_client.clone_lun(
+                volume, name, new_name, space_reserved,
+                qos_policy_group_name=qos_policy_group_name,
+                src_block=src_block, dest_block=dest_block,
+                block_count=block_count,
+                source_snapshot=source_snapshot,
+                is_snapshot=is_snapshot,
+                qos_policy_group_is_adaptive=qos_policy_group_is_adaptive,
+            )
+        except netapp_api.NaApiError as e:
+            with excutils.save_and_reraise_exception() as exc_context:
+                if 'Device busy' in e.message:
+                    self._retry_clone_lun(
+                        volume, name, new_name, space_reserved,
+                        qos_policy_group_name=qos_policy_group_name,
+                        src_block=src_block, dest_block=dest_block,
+                        block_count=block_count,
+                        source_snapshot=source_snapshot,
+                        is_snapshot=is_snapshot,
+                        qos_policy_group_is_adaptive=(
+                            qos_policy_group_is_adaptive),
+                    )
+                    exc_context.reraise = False
+
+        LOG.debug("Cloned LUN with new name %s", new_name)
+        lun = self.zapi_client.get_lun_by_args(vserver=self.vserver,
+                                               path='/vol/%s/%s'
+                                               % (volume, new_name))
+        if len(lun) == 0:
+            msg = _("No cloned LUN named %s found on the filer")
+            raise exception.VolumeBackendAPIException(data=msg % new_name)
+
+        clone_lun = lun[0]
+        self._add_lun_to_table(
+            block_base.NetAppLun('%s:%s' % (clone_lun['Vserver'],
+                                            clone_lun['Path']),
+                                 new_name,
+                                 clone_lun['Size'],
+                                 clone_lun))
+
+    def _clone_source_to_destination(self, source, destination_volume):
+        """Clone a LUN, with optional cross-pool lun-copy.
+
+        Cross-pool lun-copy runs only when clone_across_pools is True.
+        That flag is hardcoded False in Hibiscus (not a config option).
+        """
+        source_name = source['name']
+        destination_name = destination_volume['name']
+
+        # Get source and destination pool names
+        src_lun = self._get_lun_from_table(source_name)
+        src_metadata = src_lun.metadata
+        src_pool = src_metadata['Volume']
+        src_lun_path = src_metadata['Path']
+
+        # Get destination pool from volume host field
+        dest_pool = volume_utils.extract_host(
+            destination_volume['host'], level='pool')
+        dest_lun_path = '/vol/%s/%s' % (dest_pool, destination_name)
+
+        # Check if this is a cross-pool clone
+        if src_pool != dest_pool and self.clone_across_pools:
+            LOG.info("Cross-pool clone requested: %(src)s "
+                     "(pool: %(src_pool)s) -> %(dst)s (pool: %(dst_pool)s)",
+                     {'src': src_lun_path, 'src_pool': src_pool,
+                      'dst': dest_lun_path, 'dst_pool': dest_pool})
+
+            try:
+                # Get location information for source and destination
+                source_info = self._get_lun_location_info(src_lun_path)
+                # For destination, construct expected location
+                dest_info = {
+                    'vserver': self.vserver,
+                    'flexvol': dest_pool,
+                    'lun_path': dest_lun_path,
+                }
+                # Get destination aggregate info
+                try:
+                    dest_flexvol = self.zapi_client.get_flexvol(
+                        flexvol_name=dest_pool)
+                    dest_aggr_list = dest_flexvol.get('aggregate', [])
+                    if dest_aggr_list:
+                        dest_info['aggregate'] = (
+                            dest_aggr_list[0]
+                            if isinstance(dest_aggr_list, list)
+                            else dest_aggr_list)
+                except Exception as e:
+                    LOG.debug("Could not get destination aggregate: "
+                              "%(error)s", {'error': e})
+                    dest_info['aggregate'] = None
+
+                # Determine clone boundary
+                boundary = self._determine_clone_boundary(
+                    source_info, dest_info)
+
+                LOG.debug("Clone boundary: %(boundary)s",
+                          {'boundary': boundary})
+
+                # Handle cross-SVM and cross-aggregate clones
+                if boundary == na_utils.CloneBoundary.CROSS_SVM:
+                    # CinderException will trigger fallback to image download
+                    LOG.debug("Cross-pool clone across SVMs not "
+                              "supported, falling back to Glance "
+                              "download.")
+                    raise exception.VolumeDriverException()
+
+                elif boundary in (na_utils.CloneBoundary.CROSS_AGGREGATE,
+                                  na_utils.CloneBoundary.SAME_AGGREGATE):
+                    LOG.debug("Cross-pool clone using aggregate APIs: "
+                              "src=%(src)s, dst=%(dst)s",
+                              {'src': src_lun_path, 'dst': dest_lun_path})
+                    self._handle_cross_aggregate_clone(
+                        source, destination_volume, source_info, dest_info)
+                    return self._get_volume_model_update(destination_volume)
+
+            except exception.CinderException:
+                # CinderException will trigger fallback to image download
+                LOG.debug("Cross-pool clone failed, fallback to image "
+                          "download will be used if available.")
+                raise
+            except Exception as e:
+                # Unexpected error - log and raise CinderException for fallback
+                LOG.debug("Cross-pool clone setup failed: %(error)s. "
+                          "Fallback to image download will be used.",
+                          {'error': e})
+                raise exception.VolumeDriverException(
+                    message="Cross-pool clone failed: %s" % e)
+
+        # Use parent class implementation for same-pool only
+        return super(
+            NetAppBlockStorageCmodeLibrary, self
+        )._clone_source_to_destination(source, destination_volume)
+
+    def _handle_cross_aggregate_clone(self, source, destination_volume,
+                                      source_info, dest_info):
+        """Handle cross-aggregate LUN clone using lun-copy."""
+        destination_name = destination_volume['name']
+        src_lun_path = source_info['lun_path']
+        dest_lun_path = dest_info['lun_path']
+
+        # Perform the cross-aggregate copy
+        self._copy_lun_cross_aggregates(
+            src_lun_path, dest_lun_path, source_info, dest_info)
+
+        # Add LUN to table
+        lun = self.zapi_client.get_lun_by_args(
+            vserver=self.vserver,
+            path=dest_lun_path)
+        if lun:
+            clone_lun = lun[0]
+            self._add_lun_to_table(
+                block_base.NetAppLun(
+                    '%s:%s' % (clone_lun['Vserver'], clone_lun['Path']),
+                    destination_name,
+                    clone_lun['Size'],
+                    clone_lun))
+
+    def _retry_clone_lun(self, volume, name, new_name, space_reserved,
+                         qos_policy_group_name=None, src_block=0,
+                         dest_block=0, block_count=0,
+                         source_snapshot=None, is_snapshot=False,
+                         qos_policy_group_is_adaptive=False):
+        """Retry lun clone creation when ONTAP throws device busy error"""
+        # timeout and interval are configurable parameters that the user can
+        # specify under the backend stanza. If the user does not set these
+        # values, default values will be used. For example, if timeout is set
+        # to 60 seconds and interval is set to 5 seconds, then this code will
+        # retry the LUN clone every 5 seconds until the 60-second timeout is
+        # reached.
+        timeout = self.configuration.safe_get('netapp_lun_clone_busy_timeout')
+        interval = self.configuration.safe_get(
+            'netapp_lun_clone_busy_interval')
+        retries = int(timeout / interval)
+
+        for attempt in range(1, retries + 1):
+            try:
+                self.zapi_client.clone_lun(
+                    volume, name, new_name, space_reserved,
+                    qos_policy_group_name=qos_policy_group_name,
+                    src_block=src_block, dest_block=dest_block,
+                    block_count=block_count,
+                    source_snapshot=source_snapshot,
+                    is_snapshot=is_snapshot,
+                    qos_policy_group_is_adaptive=qos_policy_group_is_adaptive,
+                )
+                LOG.info("LUN clone succeeded on attempt %s.", attempt)
+                break
+            except netapp_api.NaApiError as e:
+                if 'Device busy' in e.message:
+                    LOG.debug("Attempt %s failed with device busy error."
+                              "Retrying after %s seconds...", attempt,
+                              interval)
+                    if attempt == retries:
+                        msg = _("Timed out after %s retry for LUN clone"
+                                " creation")
+                        raise na_utils.NetAppDriverException(msg % retries)
+                    time.sleep(interval)
+                else:
+                    raise netapp_api.NaApiError(e.code, e.message)
+
+    def _get_lun_location_info(self, lun_path):
+        """Get location information for a LUN.
+
+        Returns a dict with vserver, flexvol, aggregate, and other
+        location details needed for boundary-aware cloning.
+        """
+        # Parse the LUN path: /vol/flexvol_name/lun_name
+        path_parts = lun_path.split('/')
+        if len(path_parts) < 4:
+            msg = _("Invalid LUN path format: %s") % lun_path
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        flexvol_name = path_parts[2]
+
+        # Get flexvol details including aggregate information
+        try:
+            flexvol = self.zapi_client.get_flexvol(flexvol_name=flexvol_name)
+
+            # Extract aggregate name
+            aggregate = None
+            aggr_list = flexvol.get('aggregate', [])
+            if aggr_list:
+                if isinstance(aggr_list, list):
+                    aggregate = aggr_list[0]
+                else:
+                    aggregate = aggr_list
+
+            location_info = {
+                'vserver': self.vserver,
+                'flexvol': flexvol_name,
+                'aggregate': aggregate,
+                'lun_path': lun_path,
+            }
+
+            return location_info
+
+        except Exception as e:
+            LOG.debug("Failed to get location info for LUN %(path)s: "
+                      "%(error)s", {'path': lun_path, 'error': e})
+            raise
+
+    def _determine_clone_boundary(self, source_info, dest_info):
+        """Determine the cloning boundary between source and destination.
+
+        Returns a CloneBoundary enum value indicating the relationship
+        between the source and destination locations.
+        """
+        # Cross-cluster is not supported - would need cluster info
+        # For now we assume same cluster since we're using same zapi_client
+
+        # Check SVM boundary
+        if source_info['vserver'] != dest_info['vserver']:
+            return na_utils.CloneBoundary.CROSS_SVM
+
+        # Check aggregate boundary (same SVM)
+        if source_info.get('aggregate') != dest_info.get('aggregate'):
+            return na_utils.CloneBoundary.CROSS_AGGREGATE
+
+        # Check FlexVol boundary (same aggregate)
+        if source_info['flexvol'] != dest_info['flexvol']:
+            return na_utils.CloneBoundary.SAME_AGGREGATE
+
+        # Same FlexVol (same pool)
+        return na_utils.CloneBoundary.SAME_POOL
+
+    def _wait_for_lun_copy_completion(self, job_uuid, timeout=None):
+        """Monitor LUN copy job status until completion or timeout."""
+        if timeout is None:
+            timeout = self.configuration.safe_get(
+                'netapp_lun_copy_timeout') or 300
+        # Use exponential backoff starting at 2s, capped at 30s, to avoid
+        # hammering the API on short copies while still detecting completion
+        # promptly on longer ones.
+        poll_interval = 2
+        max_poll_interval = 30
+        elapsed = 0
+
+        while elapsed < timeout:
+            try:
+                status = self.zapi_client.get_lun_copy_status(job_uuid)
+
+                if not status:
+                    LOG.debug("LUN copy job %(uuid)s not found",
+                              {'uuid': job_uuid})
+                else:
+                    job_status = status.get('job-status')
+
+                    if job_status == 'complete':
+                        LOG.debug("LUN copy job completed: UUID=%(uuid)s",
+                                  {'uuid': job_uuid})
+                        return
+
+                    if job_status == 'failed':
+                        failure_reason = status.get(
+                            'last-failure-reason', 'Unknown')
+                        msg = (_("LUN copy job failed: UUID=%(uuid)s, "
+                                 "reason=%(reason)s") %
+                               {'uuid': job_uuid, 'reason': failure_reason})
+                        raise exception.VolumeBackendAPIException(data=msg)
+
+                    # Job still in progress
+                    LOG.debug("LUN copy in progress: UUID=%(uuid)s, "
+                              "status=%(status)s, elapsed=%(elapsed)ss",
+                              {'uuid': job_uuid, 'status': job_status,
+                               'elapsed': elapsed})
+
+            except exception.VolumeBackendAPIException:
+                raise
+            except Exception as e:
+                LOG.warning("Error checking LUN copy status: %(error)s",
+                            {'error': e})
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            poll_interval = min(poll_interval * 2, max_poll_interval)
+
+        # Timeout reached
+        try:
+            self.zapi_client.cancel_lun_copy(job_uuid)
+            LOG.debug("Cancelled LUN copy job due to timeout: %(uuid)s",
+                      {'uuid': job_uuid})
+        except Exception as e:
+            LOG.warning("Failed to cancel LUN copy job %(uuid)s: %(error)s",
+                        {'uuid': job_uuid, 'error': e})
+
+        msg = (_("LUN copy timeout: UUID=%(uuid)s, timeout=%(timeout)ss") %
+               {'uuid': job_uuid, 'timeout': timeout})
+        raise exception.VolumeBackendAPIException(data=msg)
+
+    def _copy_lun_cross_aggregates(self, source_lun_path, dest_lun_path,
+                                   source_info, dest_info):
+        """Copy LUN across different aggregates using lun-copy-start."""
+        source_flexvol = source_info['flexvol']
+        dest_flexvol = dest_info['flexvol']
+        source_vserver = source_info.get('vserver', self.vserver)
+        dest_vserver = dest_info.get('vserver', self.vserver)
+
+        # Extract LUN names from paths
+        source_lun_name = source_lun_path.split('/')[-1]
+        dest_lun_name = dest_lun_path.split('/')[-1]
+
+        LOG.debug("Starting cross-pool LUN copy: %(src)s -> %(dst)s",
+                  {'src': source_lun_path, 'dst': dest_lun_path})
+
+        try:
+            job_uuid = self.zapi_client.start_lun_copy(
+                lun_name=source_lun_name,
+                dest_ontap_volume=dest_flexvol,
+                dest_vserver=dest_vserver,
+                src_ontap_volume=source_flexvol,
+                src_vserver=source_vserver,
+                dest_lun_name=dest_lun_name
+            )
+
+            LOG.debug("LUN copy job started: UUID=%(uuid)s",
+                      {'uuid': job_uuid})
+
+            # Wait for copy to complete
+            self._wait_for_lun_copy_completion(job_uuid)
+
+            LOG.debug("Cross-pool LUN copy completed successfully")
+
+        except Exception as e:
+            LOG.debug("Cross-pool LUN copy failed: %(error)s",
+                      {'error': e})
+            raise exception.VolumeNotFound(volume_id=source_lun_name)
+
+    def _get_fc_target_wwpns(self, include_partner=True):
+        return self.zapi_client.get_fc_target_wwpns()
+
+    def _update_volume_stats(self, filter_function=None,
+                             goodness_function=None):
+        """Retrieve backend stats."""
+
+        LOG.debug('Updating volume stats')
+        data = {}
+        backend_name = self.configuration.safe_get('volume_backend_name')
+        data['volume_backend_name'] = backend_name or self.driver_name
+        data['vendor_name'] = 'NetApp'
+        data['driver_version'] = self.VERSION
+        data['storage_protocol'] = self.driver_protocol
+        data['pools'] = self._get_pool_stats(
+            filter_function=filter_function,
+            goodness_function=goodness_function)
+        data['sparse_copy_volume'] = True
+
+        # Used for service state report
+        data['replication_enabled'] = self.replication_enabled
+
+        data['clone_across_pools'] = self.clone_across_pools
+
+        # Surface disaggregated\-platform flag at the backend level
+        data['netapp_disaggregated_platform'] = (
+            bool(self.configuration.netapp_disaggregated_platform)
+        )
+
+        self._stats = data
+
+    def _get_pool_stats(self, filter_function=None, goodness_function=None):
+        """Retrieve pool (Data ONTAP flexvol) stats.
+
+        Pool statistics are assembled from static driver capabilities, the
+        Storage Service Catalog of flexvol attributes, and real-time capacity
+        and controller utilization metrics.  The pool name is the flexvol name.
+        """
+
+        pools = []
+
+        ssc = self.ssc_library.get_ssc()
+        if not ssc:
+            return pools
+
+        # Utilization and performance metrics require cluster-scoped
+        # credentials
+        # Performance metrics are skipped for disaggregated for now.
+        # TODO(jayaanan): Add support for performance metrics for ASA r2
+        if (self.using_cluster_credentials
+                and not self.configuration.netapp_disaggregated_platform):
+            # Update the saved cluster performance data only after the set
+            # time has passed.This prevents running slow real-time performance
+            # checks every time stats are collected. The time of the last
+            # update is stored in self.last_perf_update and checked against
+            # the netapp_performance_cache_expiry_duration setting.
+            now = timeutils.utcnow().timestamp()
+            perf_expiry = (
+                self.configuration.netapp_performance_cache_expiry_duration)
+            if (now - self.last_perf_update) > perf_expiry:
+                LOG.debug("Updating perf cache for cluster.")
+                self.perf_library.update_performance_cache(ssc)
+                self.last_perf_update = now
+                LOG.debug("Successfully updated perf cache for cluster.")
+            else:
+                LOG.debug("Using the previous perf stats from last update.")
+
+            # Get up-to-date aggregate capacities just once
+            aggregates = self.ssc_library.get_ssc_aggregates()
+            LOG.debug("Getting aggregate capacities.")
+            aggr_capacities = self.zapi_client.get_aggregate_capacities(
+                aggregates)
+            LOG.debug("Aggregate capacities successfully fetched: %s",
+                      aggr_capacities)
+        else:
+            aggr_capacities = {}
+
+        for ssc_vol_name, ssc_vol_info in ssc.items():
+
+            pool = dict()
+
+            # Add storage service catalog data
+            pool.update(ssc_vol_info)
+
+            # Add driver capabilities and config info
+            pool['QoS_support'] = self.using_cluster_credentials
+            pool['multiattach'] = True
+            pool['online_extend_support'] = True
+            # Expose disaggregated platform as a pool capability
+            pool['netapp_disaggregated_platform'] = (
+                self.configuration.safe_get('netapp_disaggregated_platform')
+            )
+            pool['reserved_percentage'] = self.reserved_percentage
+            pool['clone_across_pools'] = self.clone_across_pools
+            pool['max_over_subscription_ratio'] = (
+                self.max_over_subscription_ratio)
+            if self.configuration.netapp_disaggregated_platform:
+                # Consistency group support is not available
+                # for disaggregated platform as of now.
+                pool['consistencygroup_support'] = False
+                pool['consistent_group_snapshot_enabled'] = False
+                # Add storage availability zones info
+                saz_list = self.zapi_client.get_storage_availability_zones()
+                pool['netapp_storage_availability_zones'] = saz_list
+                LOG.debug("Getting svm aggregate capacity for disaggregated"
+                          " cluster")
+                # For disaggregated platform, calculate capacity by aggregating
+                # the SVM-mapped aggregate capacities.
+                capacity = self._get_disaggregated_capacity()
+
+            else:
+                pool['consistencygroup_support'] = True
+                pool['consistent_group_snapshot_enabled'] = True
+                pool['netapp_storage_availability_zones'] = None
+                LOG.debug("Getting flexvol %s capacity.", ssc_vol_name)
+                capacity = self.zapi_client.get_flexvol_capacity(
+                    flexvol_name=ssc_vol_name)
+
+            LOG.debug("Successfully fetched capacity details: %s", capacity)
+            size_total_gb = capacity['size-total'] / units.Gi
+            pool['total_capacity_gb'] = na_utils.round_down(size_total_gb)
+
+            size_available_gb = capacity['size-available'] / units.Gi
+            pool['free_capacity_gb'] = na_utils.round_down(size_available_gb)
+
+            # We need to fetch LUN size info to get provisioned capacity.
+            # For the disaggregated platform, we fetch LUNs across the SVM
+            # while for the Unified ONTAP, we fetch LUNs per flexvol.
+            LOG.debug("Getting LUNs with size info for pool")
+            if self.configuration.netapp_disaggregated_platform:
+                luns = self.zapi_client.get_lun_sizes_by_svm()
+                LOG.debug("Successfully fetched LUN size for pool vserver %s",
+                          self.vserver)
+            else:
+                luns = self.zapi_client.get_lun_sizes_by_volume(
+                    ssc_vol_name)
+                LOG.debug("Successfully fetched LUN size for volume: %s",
+                          ssc_vol_name)
+
+            pool['total_volumes'] = len(luns)
+            LOG.debug("Total pool volumes: %s", len(luns))
+            if self.configuration.netapp_driver_reports_provisioned_capacity:
+                provisioned_cap = 0
+                if self.configuration.netapp_disaggregated_platform:
+                    # For disaggregated platform, use storage units scoped to
+                    # the SVM to compute provisioned capacity. Snapshots are
+                    # implemented as FlexVol snapshots and do not appear as
+                    # separate storage units.
+                    provisioned_cap = (
+                        self._get_disaggregated_provisioned_capacity())
+                else:
+                    for lun in luns:
+                        lun_name = lun['path'].split('/')[-1]
+                        # Filtering luns that matches the volume name
+                        # template to exclude snapshots
+                        if volume_utils.extract_id_from_volume_name(lun_name):
+                            provisioned_cap = provisioned_cap + lun['size']
+                LOG.debug("Provisioned capacity for pool %s", provisioned_cap)
+                pool['provisioned_capacity_gb'] = na_utils.round_down(
+                    float(provisioned_cap) / units.Gi)
+            dedupe_used = 0.0
+            if (self.using_cluster_credentials and
+                    not self.configuration.netapp_disaggregated_platform):
+                dedupe_expiry = (
+                    self.configuration.netapp_dedupe_cache_expiry_duration)
+                now = timeutils.utcnow().timestamp()
+                if (now - self.last_dedupe_update) > dedupe_expiry:
+                    LOG.debug("Getting flexvol %s dedupe info.", ssc_vol_name)
+                    dedupe_used = (
+                        self.zapi_client
+                        .get_flexvol_dedupe_used_percent(ssc_vol_name)
+                    )
+                    self.last_dedupe_update = now
+                    LOG.debug("Successfully fetched flexvol dedup info: %s",
+                              dedupe_used)
+                else:
+                    LOG.debug("Get the current dedupe stats from pool %s",
+                              ssc_vol_name)
+                    assert isinstance(self._stats, dict)
+                    for current_pool in self._stats.get('pools', []):
+                        if current_pool.get('pool_name') == ssc_vol_name:
+                            dedupe_used = current_pool.get(
+                                'netapp_dedupe_used_percent')
+                            break
+            pool['netapp_dedupe_used_percent'] = na_utils.round_down(
+                dedupe_used)
+
+            aggregate_name = ssc_vol_info.get('netapp_aggregate')
+            aggr_capacity = aggr_capacities.get(aggregate_name, {})
+            pool['netapp_aggregate_used_percent'] = aggr_capacity.get(
+                'percent-used', 0)
+
+            # Add utilization data
+            utilization = self.perf_library.get_node_utilization_for_pool(
+                ssc_vol_name)
+            pool['utilization'] = na_utils.round_down(utilization)
+            pool['filter_function'] = filter_function
+            pool['goodness_function'] = goodness_function
+
+            # Add replication capabilities/stats
+            pool.update(
+                self.get_replication_backend_stats(self.configuration))
+
+            pools.append(pool)
+
+        return pools
+
+    def _get_disaggregated_provisioned_capacity(self):
+        """Return the sum of provisioned sizes for disaggregated SUs."""
+        if not self.vserver:
+            return 0
+
+        try:
+            storage_units = self.zapi_client.get_storage_units_by_svm(
+                vserver=self.vserver)
+        except Exception:
+            LOG.exception("Failed to get storage units for SVM %s.",
+                          self.vserver)
+            raise na_utils.NetAppDriverException(
+                "Failed to get storage units")
+
+        total = 0
+        for unit in storage_units or []:
+            try:
+                size = int(unit.get('provisioned-size', 0))
+            except (TypeError, ValueError):
+                # Malformed or non\-numeric size \-> treat as 0
+                size = 0
+            total += size
+        LOG.debug("Calculated provisioned capacity for SVM %s: %s",
+                  self.vserver, total)
+        return total
+
+    def _get_disaggregated_capacity(self):
+        """Calculate capacity by aggregating SVM-mapped aggregates.
+
+        Returns a dict with `size-total` and `size-available` in bytes.
+        """
+        # Get aggregates mapped to this SVM
+        aggregates = self.zapi_client.get_vserver_aggregates()
+        LOG.debug("SVM %s mapped aggregates: %s", self.vserver, aggregates)
+
+        # Fetch capacities for those aggregates
+        aggr_capacities = self.zapi_client.get_aggregate_capacities(aggregates)
+        LOG.debug("Fetched capacities for SVM aggregates: %s", aggr_capacities)
+
+        # Sum capacities across all aggregates
+        size_total = 0
+        size_available = 0
+        for caps in aggr_capacities.values():
+            total_raw = caps.get('size-total', 0)
+            avail_raw = caps.get('size-available', 0)
+            try:
+                total_val = int(total_raw)
+                avail_val = int(avail_raw)
+            except (TypeError, ValueError):
+                LOG.warning(
+                    "Skipping invalid disaggregated capacity "
+                    "entry for SVM %s: "
+                    "size-total=%r, size-available=%r, caps=%r",
+                    self.vserver, total_raw, avail_raw, caps,
+                )
+                continue
+
+            size_total += total_val
+            size_available += avail_val
+
+        return {'size-total': size_total, 'size-available': size_available}
+
+    def _update_ssc(self):
+        """Refresh the storage service catalog with the latest set of pools."""
+        if self.configuration.netapp_disaggregated_platform:
+            self.ssc_library.update_ssc_asa(self._get_cluster_to_pool_map())
+        else:
+            self.ssc_library.update_ssc(self._get_flexvol_to_pool_map())
+
+    def _get_flexvol_to_pool_map(self):
+        """Get the flexvols that match the pool name search pattern.
+
+        The map is of the format suitable for seeding the storage service
+        catalog: {<flexvol_name> : {'pool_name': <flexvol_name>}}
+        """
+
+        pool_regex = na_utils.get_pool_name_filter_regex(self.configuration)
+
+        pools = {}
+        flexvol_names = self.zapi_client.list_flexvols()
+
+        for flexvol_name in flexvol_names:
+
+            msg_args = {
+                'flexvol': flexvol_name,
+                'vol_pattern': pool_regex.pattern,
+            }
+
+            if pool_regex.match(flexvol_name):
+                msg = "Volume '%(flexvol)s' matches %(vol_pattern)s"
+                LOG.debug(msg, msg_args)
+                pools[flexvol_name] = {'pool_name': flexvol_name}
+            else:
+                msg = "Volume '%(flexvol)s' does not match %(vol_pattern)s"
+                LOG.debug(msg, msg_args)
+
+        return pools
+
+    def _get_cluster_to_pool_map(self):
+        return dot_utils.get_cluster_to_pool_map(self.zapi_client)
+
+    def delete_volume(self, volume):
+        """Driver entry point for destroying existing volumes."""
+        super(NetAppBlockStorageCmodeLibrary, self).delete_volume(volume)
+        try:
+            qos_policy_group_info = na_utils.get_valid_qos_policy_group_info(
+                volume)
+        except exception.Invalid:
+            # Delete even if there was invalid qos policy specified for the
+            # volume.
+            qos_policy_group_info = None
+        self._mark_qos_policy_group_for_deletion(qos_policy_group_info)
+
+        msg = 'Deleted LUN with name %(name)s and QoS info %(qos)s'
+        LOG.debug(msg, {'name': volume['name'], 'qos': qos_policy_group_info})
+
+    def _setup_qos_for_volume(self, volume, extra_specs):
+        try:
+            qos_policy_group_info = na_utils.get_valid_qos_policy_group_info(
+                volume, extra_specs)
+        except exception.Invalid:
+            msg = _('Invalid QoS specification detected while getting QoS '
+                    'policy for volume %s') % volume['id']
+            raise exception.VolumeBackendAPIException(data=msg)
+        pool = volume_utils.extract_host(volume['host'], level='pool')
+        qos_min_support = self.ssc_library.is_qos_min_supported(pool)
+        LOG.debug("Provisioning QoS policy group with info: %s",
+                  qos_policy_group_info)
+        self.zapi_client.provision_qos_policy_group(qos_policy_group_info,
+                                                    qos_min_support)
+        LOG.debug("Successfully provisioned QoS policy group with info: %s",
+                  qos_policy_group_info)
+        return qos_policy_group_info
+
+    def _get_volume_model_update(self, volume):
+        """Provide any updates necessary for a volume being created/managed."""
+        if self.replication_enabled:
+            return {'replication_status': fields.ReplicationStatus.ENABLED}
+
+    def _mark_qos_policy_group_for_deletion(self, qos_policy_group_info):
+        is_adaptive = na_utils.is_qos_policy_group_spec_adaptive(
+            qos_policy_group_info)
+        self.zapi_client.mark_qos_policy_group_for_deletion(
+            qos_policy_group_info, is_adaptive)
+
+    def unmanage(self, volume):
+        """Removes the specified volume from Cinder management.
+
+           Does not delete the underlying backend storage object.
+        """
+        try:
+            qos_policy_group_info = na_utils.get_valid_qos_policy_group_info(
+                volume)
+        except exception.Invalid:
+            # Unmanage even if there was invalid qos policy specified for the
+            # volume.
+            qos_policy_group_info = None
+        self._mark_qos_policy_group_for_deletion(qos_policy_group_info)
+        super(NetAppBlockStorageCmodeLibrary, self).unmanage(volume)
+
+    def failover_host(self, context, volumes, secondary_id=None, groups=None):
+        """Failover a backend to a secondary replication target.
+
+           This function combines failover() and failover_completed()
+           to perform failover when Active/Active is not enabled.
+        """
+        active_backend_name, volume_updates, group_updates = (
+            self._failover(context, volumes, secondary_id, groups))
+        self._failover_completed(context, active_backend_name)
+        return active_backend_name, volume_updates, group_updates
+
+    def failover(self, context, volumes, secondary_id=None, groups=None):
+        """Failover to replication target."""
+        return self._failover(context, volumes, secondary_id, groups)
+
+    def failover_completed(self, context, secondary_id=None):
+        """Update volume node when `failover` is completed."""
+        return self._failover_completed(context, secondary_id)
+
+    def _get_backing_flexvol_names(self):
+        """Returns a list of backing flexvol names."""
+
+        ssc = self.ssc_library.get_ssc()
+        return list(ssc.keys())
+
+    def create_group(self, group):
+        """Driver entry point for creating a generic volume group.
+
+        ONTAP does not maintain an actual Group construct. As a result, no
+        communication to the backend is necessary for generic volume group
+        creation.
+
+        :returns: Hard-coded model update for generic volume group model.
+        """
+        model_update = {'status': fields.GroupStatus.AVAILABLE}
+        return model_update
+
+    def delete_group(self, group, volumes):
+        """Driver entry point for deleting a group.
+
+        :returns: Updated group model and list of volume models
+                 for the volumes that were deleted.
+        """
+        model_update = {'status': fields.GroupStatus.DELETED}
+        volumes_model_update = []
+        for volume in volumes:
+            try:
+                self._delete_lun(volume['name'])
+                volumes_model_update.append(
+                    {'id': volume['id'], 'status': 'deleted'})
+            except Exception:
+                volumes_model_update.append(
+                    {'id': volume['id'],
+                     'status': 'error_deleting'})
+                LOG.exception("Volume %(vol)s in the group could not be "
+                              "deleted.", {'vol': volume})
+        return model_update, volumes_model_update
+
+    def update_group(self, group, add_volumes=None, remove_volumes=None):
+        """Driver entry point for updating a generic volume group.
+
+        Since no actual group construct is ever created in ONTAP, it is not
+        necessary to update any metadata on the backend. Since this is a NO-OP,
+        there is guaranteed to be no change in any of the volumes' statuses.
+        """
+        return None, None, None
+
+    def create_group_snapshot(self, group_snapshot, snapshots):
+        """Creates a Cinder group snapshot object.
+
+        The Cinder group snapshot object is created by making use of an
+        ephemeral ONTAP consistency group snapshot in order to provide
+        write-order consistency for a set of flexvol snapshots. First, a list
+        of the flexvols backing the given Cinder group must be gathered. An
+        ONTAP group-snapshot of these flexvols will create a snapshot copy of
+        all the Cinder volumes in the generic volume group. For each Cinder
+        volume in the group, it is then necessary to clone its backing LUN from
+        the ONTAP cg-snapshot. The naming convention used for the clones is
+        what indicates the clone's role as a Cinder snapshot and its inclusion
+        in a Cinder group. The ONTAP cg-snapshot of the flexvols is no longer
+        required after having cloned the LUNs backing the Cinder volumes in
+        the Cinder group.
+
+        :returns: An implicit update for group snapshot and snapshots models
+                 that is interpreted by the manager to set their models to
+                 available.
+        """
+        try:
+            if volume_utils.is_group_a_cg_snapshot_type(group_snapshot):
+                self._create_consistent_group_snapshot(group_snapshot,
+                                                       snapshots)
+            else:
+                for snapshot in snapshots:
+                    self._create_snapshot(snapshot)
+        except Exception as ex:
+            err_msg = (_("Create group snapshot failed (%s).") % ex)
+            LOG.exception(err_msg, resource=group_snapshot)
+            raise na_utils.NetAppDriverException(err_msg)
+
+        return None, None
+
+    def _create_consistent_group_snapshot(self, group_snapshot, snapshots):
+        flexvols = set()
+        for snapshot in snapshots:
+            flexvols.add(volume_utils.extract_host(
+                snapshot['volume']['host'], level='pool'))
+
+        self.zapi_client.create_cg_snapshot(flexvols, group_snapshot['id'])
+
+        for snapshot in snapshots:
+            self._clone_lun(snapshot['volume']['name'], snapshot['name'],
+                            source_snapshot=group_snapshot['id'])
+
+        for flexvol in flexvols:
+            try:
+                self.zapi_client.wait_for_busy_snapshot(
+                    flexvol, group_snapshot['id'])
+                self.zapi_client.delete_snapshot(
+                    flexvol, group_snapshot['id'])
+            except exception.SnapshotIsBusy:
+                self.zapi_client.mark_snapshot_for_deletion(
+                    flexvol, group_snapshot['id'])
+
+    def delete_group_snapshot(self, group_snapshot, snapshots):
+        """Delete LUNs backing each snapshot in the group snapshot.
+
+        :returns: An implicit update for snapshots models that is interpreted
+                 by the manager to set their models to deleted.
+        """
+        for snapshot in snapshots:
+            self._delete_lun(snapshot['name'])
+            LOG.debug("Snapshot %s deletion successful", snapshot['name'])
+
+        return None, None
+
+    def create_group_from_src(self, group, volumes, group_snapshot=None,
+                              snapshots=None, source_group=None,
+                              source_vols=None):
+        """Creates a group from a group snapshot or a group of cinder vols.
+
+        :returns: An implicit update for the volumes model that is
+                 interpreted by the manager as a successful operation.
+        """
+        LOG.debug("VOLUMES %s ", ', '.join([vol['id'] for vol in volumes]))
+        volume_model_updates = []
+
+        if group_snapshot:
+            vols = zip(volumes, snapshots)
+
+            for volume, snapshot in vols:
+                source = {
+                    'name': snapshot['name'],
+                    'size': snapshot['volume_size'],
+                }
+                volume_model_update = self._clone_source_to_destination(
+                    source, volume)
+                if volume_model_update is not None:
+                    volume_model_update['id'] = volume['id']
+                    volume_model_updates.append(volume_model_update)
+
+        else:
+            vols = zip(volumes, source_vols)
+
+            for volume, old_src_vref in vols:
+                src_lun = self._get_lun_from_table(old_src_vref['name'])
+                source = {'name': src_lun.name, 'size': old_src_vref['size']}
+                volume_model_update = self._clone_source_to_destination(
+                    source, volume)
+                if volume_model_update is not None:
+                    volume_model_update['id'] = volume['id']
+                    volume_model_updates.append(volume_model_update)
+
+        return None, volume_model_updates
+
+    def _move_lun(self, volume, src_ontap_volume, dest_ontap_volume,
+                  dest_lun_name=None):
+        """Moves LUN from an ONTAP volume to another."""
+        operation_info = self.zapi_client.start_lun_move(
+            volume.name, dest_ontap_volume, src_ontap_volume=src_ontap_volume,
+            dest_lun_name=dest_lun_name)
+        LOG.debug('Start moving LUN %s from %s to %s. ',
+                  volume.name, src_ontap_volume,
+                  dest_ontap_volume)
+
+        def _wait_lun_move_complete():
+            move_status = self.zapi_client.get_lun_move_status(operation_info)
+            LOG.debug('Waiting for LUN move to complete. '
+                      'Current status is: %s.', move_status['job-status'])
+
+            if not move_status:
+                status_error_msg = (_("Error moving LUN %s. The movement"
+                                      "status could not be retrieved."))
+                raise na_utils.NetAppDriverException(
+                    status_error_msg % (volume.id))
+            elif move_status['job-status'] == 'destroyed':
+                status_error_msg = (_('Error moving LUN %s. %s.'))
+                raise na_utils.NetAppDriverException(
+                    status_error_msg % (volume.id,
+                                        move_status['last-failure-reason']))
+            elif move_status['job-status'] == 'complete':
+                raise loopingcall.LoopingCallDone()
+
+        try:
+            timer = loopingcall.FixedIntervalWithTimeoutLoopingCall(
+                _wait_lun_move_complete)
+            timer.start(
+                interval=15,
+                timeout=self.configuration.netapp_migrate_volume_timeout
+            ).wait()
+        except loopingcall.LoopingCallTimeOut:
+            msg = (_('Timeout waiting to complete move operation of LUN %s.'))
+            raise na_utils.NetAppDriverTimeout(msg % volume.id)
+
+    def _cancel_lun_copy(self, job_uuid, volume, dest_pool, dest_backend_name):
+        """Cancel an on-going lun copy operation."""
+        try:
+            # NOTE(sfernand): Another approach would be first checking if
+            # the copy operation isn't in `destroying` or `destroyed` states
+            # before issuing cancel.
+            self.zapi_client.cancel_lun_copy(job_uuid)
+        except na_utils.NetAppDriverException:
+            dest_client = dot_utils.get_client_for_backend(dest_backend_name)
+            lun_path = '/vol/%s/%s' % (dest_pool, volume.name)
+            try:
+                dest_client.destroy_lun(lun_path)
+            except Exception:
+                LOG.warning('Error cleaning up LUN %s in destination volume. '
+                            'Verify if destination volume still exists in '
+                            'pool %s and delete it manually to avoid unused '
+                            'resources.', lun_path, dest_pool)
+
+    def _copy_lun(self, volume, src_ontap_volume, src_vserver,
+                  dest_ontap_volume, dest_vserver, dest_lun_name=None,
+                  dest_backend_name=None, cancel_on_error=False):
+        """Copies LUN from an ONTAP volume to another."""
+        operation_info = self.zapi_client.start_lun_copy(
+            volume.name, dest_ontap_volume, dest_vserver,
+            src_ontap_volume=src_ontap_volume, src_vserver=src_vserver,
+            dest_lun_name=dest_lun_name)
+        LOG.debug('Start copying LUN %(vol)s from '
+                  '%(src_vserver)s:%(src_ontap_vol)s to '
+                  '%(dest_vserver)s:%(dest_ontap_vol)s.',
+                  {'vol': volume.name, 'src_vserver': src_vserver,
+                   'src_ontap_vol': src_ontap_volume,
+                   'dest_vserver': dest_vserver,
+                   'dest_ontap_vol': dest_ontap_volume})
+
+        def _wait_lun_copy_complete():
+            copy_status = self.zapi_client.get_lun_copy_status(operation_info)
+            LOG.debug('Waiting for LUN copy job to complete. Current '
+                      'status is: %s.', copy_status['job-status'])
+            if not copy_status:
+                status_error_msg = (_("Error copying LUN %s. The copy"
+                                      "status could not be retrieved."))
+                raise na_utils.NetAppDriverException(
+                    status_error_msg % (volume.id))
+            elif copy_status['job-status'] == 'destroyed':
+                status_error_msg = (_('Error copying LUN %s. %s.'))
+                raise na_utils.NetAppDriverException(
+                    status_error_msg % (volume.id,
+                                        copy_status['last-failure-reason']))
+            elif copy_status['job-status'] == 'complete':
+                raise loopingcall.LoopingCallDone()
+
+        try:
+            timer = loopingcall.FixedIntervalWithTimeoutLoopingCall(
+                _wait_lun_copy_complete)
+            timer.start(
+                interval=10,
+                timeout=self.configuration.netapp_migrate_volume_timeout
+            ).wait()
+        except Exception as e:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if cancel_on_error:
+                    self._cancel_lun_copy(operation_info, volume,
+                                          dest_ontap_volume,
+                                          dest_backend_name=dest_backend_name)
+                if isinstance(e, loopingcall.LoopingCallTimeOut):
+                    ctxt.reraise = False
+                    msg = (_('Timeout waiting volume %s to complete '
+                             'migration.'))
+                    raise na_utils.NetAppDriverTimeout(msg % volume.id)
+
+    def _finish_migrate_volume_to_vserver(self, src_volume):
+        """Finish volume migration to another vserver within the cluster."""
+        # The source volume can be safely deleted after a successful migration.
+        self.delete_volume(src_volume)
+        # LUN cache for current backend can be deleted after migration.
+        self._delete_lun_from_table(src_volume.name)
+
+    def _migrate_volume_to_vserver(self, volume, src_pool, src_vserver,
+                                   dest_pool, dest_vserver, dest_backend_name):
+        """Migrate volume to a another vserver within the same cluster."""
+        LOG.info('Migrating volume %(vol)s from '
+                 '%(src_vserver)s:%(src_ontap_vol)s to '
+                 '%(dest_vserver)s:%(dest_ontap_vol)s.',
+                 {'vol': volume.id, 'src_vserver': src_vserver,
+                  'src_ontap_vol': src_pool, 'dest_vserver': dest_vserver,
+                  'dest_ontap_vol': dest_pool})
+        # NOTE(sfernand): Migrating to a different vserver relies on coping
+        # operations which are always disruptive, as it requires the
+        # destination volume to be added as a new block device to the Nova
+        # instance. This differs from migrating volumes in a same vserver,
+        # since we can make use of a LUN move operation without the
+        # need of changing the iSCSI target.
+        if volume.status != fields.VolumeStatus.AVAILABLE:
+            msg = _("Volume status must be 'available' in order to "
+                    "migrate volume to another vserver.")
+            LOG.error(msg)
+            raise exception.InvalidVolume(reason=msg)
+
+        vserver_peer_application = 'lun_copy'
+        self.create_vserver_peer(src_vserver, self.backend_name, dest_vserver,
+                                 [vserver_peer_application])
+        self._copy_lun(volume, src_pool, src_vserver, dest_pool,
+                       dest_vserver, dest_backend_name=dest_backend_name,
+                       cancel_on_error=True)
+        self._finish_migrate_volume_to_vserver(volume)
+        LOG.info('Successfully migrated volume %(vol)s from '
+                 '%(src_vserver)s:%(src_ontap_vol)s '
+                 'to %(dest_vserver)s:%(dest_ontap_vol)s.',
+                 {'vol': volume.id, 'src_vserver': src_vserver,
+                  'src_ontap_vol': src_pool, 'dest_vserver': dest_vserver,
+                  'dest_ontap_vol': dest_pool})
+        # No model updates are necessary, so return empty dict
+        return {}
+
+    def _finish_migrate_volume_to_pool(self, src_volume, dest_pool):
+        """Finish volume migration to another pool within the same vserver."""
+        # LUN cache must be updated with new path and volume information.
+        lun = self._get_lun_from_table(src_volume.name)
+        new_lun_path = '/vol/%s/%s' % (dest_pool, src_volume.name)
+        lun.metadata['Path'] = new_lun_path
+        lun.metadata['Volume'] = dest_pool
+
+    def _migrate_volume_to_pool(self, volume, src_pool, dest_pool, vserver,
+                                dest_backend_name):
+        """Migrate volume to another Cinder Pool within the same vserver."""
+        LOG.info('Migrating volume %(vol)s from pool %(src)s to '
+                 '%(dest)s within vserver %(vserver)s.',
+                 {'vol': volume.id, 'src': src_pool, 'dest': dest_pool,
+                  'vserver': vserver})
+        updates = {}
+        try:
+            self._move_lun(volume, src_pool, dest_pool)
+        except na_utils.NetAppDriverTimeout:
+            error_msg = (_('Timeout waiting volume %s to complete migration.'
+                           'Volume status is set to maintenance to prevent '
+                           'performing operations with this volume. Check the '
+                           'migration status on the storage side and set '
+                           'volume status manually if migration succeeded.'))
+            LOG.warning(error_msg, volume.id)
+            updates['status'] = fields.VolumeStatus.MAINTENANCE
+        except na_utils.NetAppDriverException as e:
+            error_msg = (_('Failed to migrate volume %(vol)s from pool '
+                           '%(src)s to %(dest)s. %(err)s'))
+            raise na_utils.NetAppDriverException(
+                error_msg % {'vol': volume.id, 'src': src_pool,
+                             'dest': dest_pool, 'err': e})
+
+        self._finish_migrate_volume_to_pool(volume, dest_pool)
+        LOG.info('Successfully migrated volume %(vol)s from pool %(src)s '
+                 'to %(dest)s within vserver %(vserver)s.',
+                 {'vol': volume.id, 'src': src_pool, 'dest': dest_pool,
+                  'vserver': vserver})
+        return updates
+
+    def migrate_volume(self, context, volume, host):
+        """Migrate Cinder volume to the specified pool or vserver."""
+        return self.migrate_volume_ontap_assisted(
+            volume, host, self.backend_name, self.configuration.netapp_vserver)
+
+    def revert_to_snapshot(self, volume, snapshot):
+        """Driver entry point for reverting volume to snapshot."""
+        try:
+            self._revert_to_snapshot(volume, snapshot)
+        except Exception:
+            raise exception.VolumeBackendAPIException(
+                "Revert snapshot failed.")
+
+    def _revert_to_snapshot(self, volume, snapshot):
+        """Sets up all required resources for _swap_luns.
+
+        If _swap_luns fails, the cloned LUN is destroyed.
+        """
+        new_lun_name = self._clone_snapshot(snapshot["name"])
+
+        LOG.debug("Cloned from snapshot: %s.", new_lun_name)
+
+        lun = self._get_lun_from_table(volume["name"])
+        volume_path = lun.metadata["Path"]
+        seg = volume_path.split("/")
+        lun_name = seg[-1]
+        flexvol_name = seg[2]
+
+        try:
+            self._swap_luns(lun_name, new_lun_name, flexvol_name)
+        except Exception:
+            LOG.error("Swapping LUN from %s to %s failed.", lun_name,
+                      new_lun_name)
+            with excutils.save_and_reraise_exception():
+                try:
+                    LOG.debug("Deleting temporary reverted LUN %s.",
+                              new_lun_name)
+                    new_lun_path = "/vol/%s/%s" % (flexvol_name, new_lun_name)
+                    self.zapi_client.destroy_lun(new_lun_path)
+                except Exception:
+                    LOG.error("Failure deleting temporary reverted LUN %s. "
+                              "A manual deletion is required.", new_lun_name)
+
+    def _clone_snapshot(self, snapshot_name):
+        """Returns the name of the LUN cloned from snapshot.
+
+        Creates a LUN with same metadata as original LUN and then clones
+        from snapshot. If clone operation fails, the new LUN is deleted.
+        """
+        snapshot_lun = self._get_lun_from_table(snapshot_name)
+        snapshot_path = snapshot_lun.metadata["Path"]
+        lun_name = snapshot_path.split("/")[-1]
+        flexvol_name = snapshot_path.split("/")[2]
+
+        LOG.info("Cloning LUN %s from snapshot %s in volume %s.", lun_name,
+                 snapshot_name, flexvol_name)
+
+        block_count = self._get_lun_block_count(snapshot_path)
+        if block_count == 0:
+            msg = _("%s cannot be reverted using clone operation"
+                    " as it contains no blocks.")
+            raise exception.VolumeBackendAPIException(data=msg % snapshot_name)
+
+        new_snap_name = "new-%s" % snapshot_name
+
+        try:
+            self._clone_lun(snapshot_name, new_snap_name,
+                            space_reserved='false', is_snapshot=True)
+            return new_snap_name
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                try:
+                    new_lun_path = "/vol/%s/%s" % (flexvol_name, new_snap_name)
+                    self.zapi_client.destroy_lun(new_lun_path)
+                except Exception:
+                    LOG.error("Failure deleting temporary reverted LUN %s. "
+                              "A manual deletion is required.", new_snap_name)
+
+    def _swap_luns(self, original_lun, new_lun, flexvol_name):
+        """Swaps cloned and original LUNs using a temporary LUN.
+
+        Moves the original LUN to a temporary path, then moves the cloned LUN
+        to the original path (if this fails, moves the temporary LUN back as
+        original LUN) and finally destroys the LUN with temporary path.
+        """
+        tmp_lun = "tmp-%s" % original_lun
+
+        original_path = "/vol/%s/%s" % (flexvol_name, original_lun)
+        tmp_path = "/vol/%s/%s" % (flexvol_name, tmp_lun)
+        new_path = "/vol/%s/%s" % (flexvol_name, new_lun)
+
+        LOG.debug("Original Path: %s.", original_path)
+        LOG.debug("Temporary Path: %s.", tmp_path)
+        LOG.debug("New Path %s.", new_path)
+
+        try:
+            self.zapi_client.move_lun(original_path, tmp_path)
+        except Exception:
+            msg = _("Failure moving original LUN from %s to %s." %
+                    (original_path, tmp_path))
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        try:
+            self.zapi_client.move_lun(new_path, original_path)
+        except Exception:
+            LOG.debug("Move temporary reverted LUN failed. Moving back "
+                      "original LUN to original path.")
+            try:
+                self.zapi_client.move_lun(tmp_path, original_path)
+            except Exception:
+                LOG.error("Could not move original LUN path from %s to %s. "
+                          "Cinder may lose the volume management. Please, you "
+                          "should move it back manually.",
+                          tmp_path, original_path)
+
+            msg = _("Failure moving temporary reverted LUN from %s to %s.")
+            raise exception.VolumeBackendAPIException(
+                data=msg % (new_path, original_path))
+        try:
+            self.zapi_client.destroy_lun(tmp_path)
+        except Exception:
+            LOG.error("Failure deleting old LUN %s. A manual deletion "
+                      "is required.", tmp_lun)
